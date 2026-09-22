@@ -1,2 +1,2 @@
-// Kept in sync with package.json "version" by hand; used for the User-Agent header.
-export const VERSION = '0.1.0';
+// Kept in sync with package.json "version" (checked by a test); used for the User-Agent header.
+export const VERSION = '1.1.0';

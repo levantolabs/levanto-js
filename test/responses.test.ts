@@ -1,185 +1,122 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { Choice, Scale, Sort, Tags, YesNo } from '../src/index';
+/** What the SDK returns: envelopes as sent, batch answers flattened and aligned. */
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
-  installFetchMock,
-  jsonResponse,
-  makeClient,
-  yesnoEnvelope,
-  choiceEnvelope,
-  scaleEnvelope,
-  sortEnvelope,
-  tagsEnvelope,
-  type FetchMock,
-} from './_helpers';
+  Choice,
+  Scale,
+  Sort,
+  Tags,
+  YesNo,
+  type BatchResult,
+  type ChoiceResult,
+  type DecideEnvelope,
+  type SortResult,
+  type TagsResult,
+  type YesNoResult,
+} from '../src';
+import { Recorder, client, expectValidResponse } from './helpers';
+import * as samples from './samples';
 
-let fetchMock: FetchMock;
+const LEVELS = ['none', 'low', 'medium', 'high', 'severe'];
 
-beforeEach(() => {
-  fetchMock = installFetchMock();
+describe('samples match the spec', () => {
+  it.each(Object.entries(samples.SINGLES))('%s', (schema, bodies) => {
+    for (const body of bodies) expectValidResponse(body, schema);
+  });
+  it('batch', () => expectValidResponse(samples.batch([samples.YESNO, 'bad question'], [samples.SORT]), 'BatchDecideResponsePublic'));
 });
 
-afterEach(() => {
-  vi.restoreAllMocks();
-});
+describe('responses', () => {
+  it.each(Object.values(samples.SINGLES).flat().map((b) => [(b as { id: string }).id, b] as const))(
+    'decide returns the envelope unchanged (%s)',
+    async (_, body) => {
+      expect(await client(new Recorder([200, body])).decide('doc', new YesNo('q'))).toEqual(body);
+    }
+  );
 
-describe('decide returns the full envelope', () => {
-  it('yesno', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(yesnoEnvelope));
-    const env = await makeClient().decide('doc', new YesNo('q'));
-    expect(env.id).toBe('yesno');
-    expect(env.kind).toBe('yesno');
-    expect(env.meta).toEqual({ model: 'sage-0.5', latency_ms: 12 });
-    expect(env.result).toEqual({ probability: 0.82, confidence: 0.91, answer: 'yes' });
+  it('null answers come through', async () => {
+    expect(await client(new Recorder([200, samples.YESNO_UNSURE])).yesno('doc', 'q')).toEqual({ answer: null, probability: 0.51 });
+    const ch = await client(new Recorder([200, samples.CHOICE_UNSURE])).choice('doc', 'q', ['approve', 'revise']);
+    expect([ch.chosen, ch.probability, ch.probabilities.length]).toEqual([null, null, 2]);
+    const tg = await client(new Recorder([200, samples.TAGS])).tags('doc', ['summary', 'outline', 'quiz']);
+    expect(tg.tags.map((t) => t.applies)).toEqual([true, false, null]);
+    const so = await client(new Recorder([200, samples.SORT_NO_CONFIDENCE])).sort([{ id: 'a', content: 'x' }], 'q');
+    expect(so.confidence).toBeNull();
   });
 
-  it('choice', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(choiceEnvelope));
-    const env = await makeClient().decide('doc', new Choice('pick', ['approve', 'revise']));
-    expect(env.result.chosen).toBe('approve');
-    expect(env.result.probabilities).toHaveLength(2);
+  it('reasoning and usage meta come through', async () => {
+    const env = await client(new Recorder([200, samples.YESNO_REASONED])).decide('doc', new YesNo('q'), { reasoning: 'on' });
+    expect(env.meta.reasoning).toEqual(samples.REASONING_META);
+    const img = await client(new Recorder([200, samples.IMAGE_YESNO])).decide('doc', new YesNo('q'));
+    expect(img.meta.usage?.image_count).toBe(1);
   });
 
-  it('scale', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(scaleEnvelope));
-    const env = await makeClient().decide('doc', new Scale('rate', ['a', 'b', 'c', 'd', 'e']));
-    expect(env.result).toEqual({ expectation: 2.8, confidence: 0.6 });
-  });
-});
-
-describe('shortcuts return just the result payload', () => {
-  it('yesno', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(yesnoEnvelope));
-    const r = await makeClient().yesno('doc', 'q');
-    expect(r).toEqual({ probability: 0.82, confidence: 0.91, answer: 'yes' });
-  });
-
-  it('choice', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(choiceEnvelope));
-    const r = await makeClient().choice('doc', 'pick', ['approve', 'revise']);
-    expect(r.chosen).toBe('approve');
-  });
-
-  it('scale', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(scaleEnvelope));
-    const r = await makeClient().scale('doc', 'rate', ['a', 'b', 'c', 'd', 'e']);
-    expect(r.expectation).toBe(2.8);
-  });
-
-  it('tags with applies flag', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(tagsEnvelope));
-    const r = await makeClient().tags('doc', [{ id: 'urgent', threshold: 0.5 }, 'spam']);
-    expect(r.tags[0]).toEqual({ id: 'urgent', probability: 0.9, confidence: 0.8, applies: true });
-    expect(r.tags[1].applies).toBeUndefined();
-  });
-});
-
-describe('sort confidence is nullable', () => {
-  it('parses a numeric confidence', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(sortEnvelope));
-    const r = await makeClient().sort(
-      [{ id: 'a', content: 'a' }, { id: 'b', content: 'b' }, { id: 'c', content: 'c' }],
-      'order'
-    );
-    expect(r.sorted).toEqual(['b', 'a', 'c']);
-    expect(r.confidence).toBe(0.4);
-  });
-
-  it('parses a null confidence (long lists)', async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse({
-        id: 'sort',
-        kind: 'sort',
-        result: { sorted: ['a', 'b'], confidence: null },
-        meta: { model: 'm', latency_ms: 5 },
-      })
-    );
-    const r = await makeClient().sort(
-      [{ id: 'a', content: 'a' }, { id: 'b', content: 'b' }],
-      'order'
-    );
-    expect(r.confidence).toBeNull();
-  });
-});
-
-describe('grounding_meta passthrough', () => {
-  it('surfaces grounding_meta on the envelope', async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse({
-        ...yesnoEnvelope,
-        grounding_meta: {
-          triggered: true,
-          queries: ['who is the ceo'],
-          sources: [{ url: 'https://example.com', title: 'X' }],
-        },
-      })
-    );
-    const env = await makeClient().decide('doc', new YesNo('q', { grounding: {} }));
-    expect(env.grounding_meta?.triggered).toBe(true);
-    expect(env.grounding_meta?.queries).toEqual(['who is the ceo']);
-    expect(env.grounding_meta?.sources).toHaveLength(1);
-  });
-
-  it('absent when grounding did not run', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(yesnoEnvelope));
-    const env = await makeClient().decide('doc', new YesNo('q'));
-    expect(env.grounding_meta).toBeUndefined();
-  });
-});
-
-describe('batch response parsing', () => {
-  it('flattens the nested envelope so items read like single decides', async () => {
-    // The batch groups results per document: results[0].answers[] holds one
-    // answer per question, each nesting a full single-decide envelope.
-    fetchMock.mockResolvedValue(
-      jsonResponse({
-        results: [
-          {
-            answers: [
-              {
-                ok: true,
-                result: {
-                  id: 'q0',
-                  kind: 'yesno',
-                  result: { probability: 0.5, confidence: 0.5, answer: 'no' },
-                  meta: { model: 'sage-0.5', latency_ms: 11 },
-                },
-              },
-              {
-                ok: true,
-                result: {
-                  id: 'mytags',
-                  kind: 'tags',
-                  result: { tags: [{ id: 't', probability: 0.2, confidence: 0.3 }] },
-                  meta: { model: 'sage-0.5', latency_ms: 14 },
-                  grounding_meta: { triggered: true, queries: ['t?'] },
-                },
-              },
-              { ok: false, error: 'rendered request too large' },
-            ],
-          },
-        ],
-        meta: { request_count: 1, question_count: 3 },
-      })
-    );
-    const items = await makeClient().decide('doc', [
-      new YesNo('q'),
-      new Tags(['t'], { id: 'mytags' }),
-      new Sort('order'),
+  it('batch items read like single decides', async () => {
+    const rec = new Recorder([200, samples.batch([samples.YESNO_REASONED, samples.SCALE, samples.GROUNDED])]);
+    const items = await client(rec).decide('doc', [new YesNo('a'), new Scale('b', LEVELS, { id: 'sev' }), new YesNo('c')]);
+    expect(items.map((i) => [i.id, i.kind, i.ok])).toEqual([
+      ['q0', 'yesno', true],
+      ['sev', 'scale', true],
+      ['q2', 'yesno', true],
     ]);
-    expect(items).toHaveLength(3);
-    expect(items.map((i) => i.id)).toEqual(['q0', 'mytags', 'q2']);
-    expect(items.map((i) => i.kind)).toEqual(['yesno', 'tags', 'sort']);
-    // ok item: result is the bare payload (not the envelope), plus meta.
+    expect(items[0].result).toEqual(samples.YESNO_REASONED.result);
+    expect(items[0].meta?.reasoning?.tokens).toBe(312);
+    expect(items[1]).not.toHaveProperty('grounding_meta');
+    expect(items[2].grounding_meta?.triggered).toBe(true);
+  });
+
+  it('a failed batch answer is isolated', async () => {
+    const rec = new Recorder([200, samples.batch([samples.YESNO, 'sort needs list content'])]);
+    const items = await client(rec).decide('doc', [new YesNo('a'), new Sort('b')]);
     expect(items[0].ok).toBe(true);
-    expect(items[0].result).toEqual({ probability: 0.5, confidence: 0.5, answer: 'no' });
-    expect(items[0].meta).toEqual({ model: 'sage-0.5', latency_ms: 11 });
-    expect(items[0].grounding_meta).toBeUndefined();
-    // grounding_meta is surfaced when the nested envelope carried it.
-    expect(items[1].grounding_meta?.triggered).toBe(true);
-    // error item: no result/meta, error is set.
-    expect(items[2].ok).toBe(false);
-    expect(items[2].error).toBe('rendered request too large');
-    expect(items[2].result).toBeUndefined();
-    expect(items[2].meta).toBeUndefined();
+    expect(items[1]).toEqual({ id: 'q1', kind: 'sort', ok: false, error: 'sort needs list content' });
+  });
+
+  it('a missing batch answer is reported, not dropped', async () => {
+    const items = await client(new Recorder([200, samples.batch([samples.YESNO])])).decide('doc', [new YesNo('a'), new YesNo('b')]);
+    expect(items).toHaveLength(2);
+    expect(items[1]).toMatchObject({ ok: false, error: expect.stringContaining('missing') });
+  });
+
+  it('groups align to input', async () => {
+    const rec = new Recorder([200, samples.batch([samples.YESNO], [samples.CHOICE, samples.TAGS])]);
+    const out = await client(rec).decideGroups([
+      { document: 'doc a', questions: [new YesNo('a')] },
+      { document: 'doc b', questions: [new Choice('b', ['x', 'y']), new Tags(['t'], { id: 'tg' })] },
+    ]);
+    expect(out.map((g) => g.items.map((i) => [i.id, i.kind]))).toEqual([[['q0', 'yesno']], [['q0', 'choice'], ['tg', 'tags']]]);
+    expect(out[1].items[1].result).toEqual(samples.TAGS.result);
+  });
+});
+
+it('batch meta is kept', async () => {
+  const meta = { model: 'levanto-sage-v1.1', request_count: 1, question_count: 2, latency_ms: 240.2,
+    usage: { billed_input_tokens: 14, image_count: 1, image_tokens: 65 } };
+  const body = { ...samples.batch([samples.YESNO, samples.SCALE]), meta };
+  const items = await client(new Recorder([200, body])).decide('doc', [new YesNo('a'), new Scale('b', LEVELS)]);
+  expect(items.meta).toEqual(meta);
+  expect(items).toHaveLength(2);
+  expect(items[0].ok).toBe(true);
+  const groups = await client(new Recorder([200, body])).decideGroups([{ document: 'doc', questions: [new YesNo('a'), new Scale('b', LEVELS)] }]);
+  expect(groups.meta).toEqual(meta);
+  expect(groups[0].items[1].kind).toBe('scale');
+});
+
+describe('types', () => {
+  it('decide narrows the result type by question kind', () => {
+    const c = client(new Recorder());
+    expectTypeOf(c.decide('d', new YesNo('q'))).resolves.toEqualTypeOf<DecideEnvelope<'yesno'>>();
+    expectTypeOf<DecideEnvelope<'yesno'>['result']>().toEqualTypeOf<YesNoResult>();
+    expectTypeOf(c.decide('d', [new YesNo('q')])).resolves.toEqualTypeOf<BatchResult>();
+    expectTypeOf(c.choice('d', 'q', ['a'])).resolves.toEqualTypeOf<ChoiceResult>();
+    expectTypeOf(c.sort([], 'q')).resolves.toEqualTypeOf<SortResult>();
+    expectTypeOf(c.tags('d', ['a'])).resolves.toEqualTypeOf<TagsResult>();
+  });
+
+  it('nullable fields are nullable', () => {
+    expectTypeOf<YesNoResult['answer']>().toEqualTypeOf<'yes' | 'no' | null>();
+    expectTypeOf<ChoiceResult['chosen']>().toEqualTypeOf<string | null>();
+    expectTypeOf<ChoiceResult['probability']>().toEqualTypeOf<number | null>();
+    expectTypeOf<TagsResult['tags'][number]['applies']>().toEqualTypeOf<boolean | null>();
+    expectTypeOf<YesNoResult>().not.toHaveProperty('confidence');
   });
 });

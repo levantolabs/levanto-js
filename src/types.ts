@@ -1,50 +1,47 @@
-/** The five decision kinds Sage supports. */
+/** Response types: plain objects, exactly as the API sends them (snake_case). */
+
 export type Kind = 'yesno' | 'choice' | 'scale' | 'sort' | 'tags';
 
-// ---------------------------------------------------------------------------
-// Document (content) shapes
-// ---------------------------------------------------------------------------
+/** `auto` (server default) reasons only when needed, `off` never, `on` always. */
+export type Reasoning = 'auto' | 'off' | 'on';
 
-/** Explicit single-document text form. */
+// --- content -----------------------------------------------------------------
+
 export interface TextContent {
   kind: 'text';
   value: string;
 }
 
-/** One item in a list document. */
+/** Image content (beta): a base64 `data:` URI (PNG, JPEG, WebP) plus optional text. */
+export interface ImageContent {
+  kind: 'image';
+  media: string;
+  text?: string;
+}
+
+/** One item to sort. */
 export interface ListItem {
   id: string;
   content: string;
 }
 
-/** Explicit list form (e.g. for `sort` or multi-item scoring). */
 export interface ListContent {
   kind: 'list';
   value: ListItem[];
 }
 
-/** The normalized content that goes on the wire. */
-export type Content = string | TextContent | ListContent;
+export type Content = string | TextContent | ImageContent | ListContent;
 
-/**
- * What callers may pass as a `document`:
- * - a bare string (sent as-is; the API treats it as text),
- * - an explicit `{ kind: 'text' | 'list', value }` object (passed through),
- * - a bare array of `{ id, content }` items (wrapped as `{ kind: 'list', value }`).
- *
- * List content items must be `{ id, content }`; the API rejects bare strings.
- */
-export type DocumentInput = string | TextContent | ListContent | ListItem[];
+/** What a `document` can be: text, image, list content, or a bare array of items (Sort). */
+export type DocumentInput = Content | ListItem[];
 
-// ---------------------------------------------------------------------------
-// Result payloads, one per kind
-// ---------------------------------------------------------------------------
+// --- results -----------------------------------------------------------------
 
 export interface YesNoResult {
+  /** `null`: Sage isn't sure. */
+  answer: 'yes' | 'no' | null;
+  /** Calibrated P(yes). */
   probability: number;
-  confidence: number;
-  /** The raw API value: `'yes'` when `probability >= 0.5`, else `'no'`. */
-  answer: 'yes' | 'no';
 }
 
 export interface ChoiceProbability {
@@ -53,43 +50,38 @@ export interface ChoiceProbability {
 }
 
 export interface ChoiceResult {
-  chosen: string;
-  confidence: number;
+  /** `null`: the top options are too close to call. */
+  chosen: string | null;
+  /** P(`chosen` is correct); `null` when `chosen` is `null`. */
+  probability: number | null;
+  /** Every option in request order. Independent: they don't sum to 1. */
   probabilities: ChoiceProbability[];
 }
 
 export interface ScaleResult {
+  /** 0..4 */
   expectation: number;
   confidence: number;
 }
 
 export interface SortResult {
+  /** Item ids, in order. */
   sorted: string[];
-  /** The API types this as nullable; never assume it is a number. */
   confidence: number | null;
 }
 
 export interface TagResult {
   id: string;
+  /** Calibrated P(tag applies). */
   probability: number;
-  confidence: number;
-  /** `boolean` when the tag was created with a `threshold`, otherwise `null`. */
-  applies?: boolean | null;
+  /** Sage's verdict; `null` when too close to call. */
+  applies: boolean | null;
 }
 
 export interface TagsResult {
   tags: TagResult[];
 }
 
-/** Union of every result payload. */
-export type Result =
-  | YesNoResult
-  | ChoiceResult
-  | ScaleResult
-  | SortResult
-  | TagsResult;
-
-/** Maps a decision kind to its result payload type. */
 export interface ResultForKind {
   yesno: YesNoResult;
   choice: ChoiceResult;
@@ -98,40 +90,68 @@ export interface ResultForKind {
   tags: TagsResult;
 }
 
-// ---------------------------------------------------------------------------
-// Envelopes
-// ---------------------------------------------------------------------------
+export type Result = ResultForKind[Kind];
+
+// --- meta --------------------------------------------------------------------
+
+export interface Usage {
+  billed_input_tokens: number;
+  rendered_tokens?: number | null;
+  image_count?: number;
+  image_tokens?: number;
+}
+
+export interface ReasoningMeta {
+  /** The first pass signalled the question needs reasoning. */
+  fired: boolean;
+  /** The reasoning pass executed. */
+  ran: boolean;
+  /** `false`: the first-pass answer was returned; `null`: it didn't run. */
+  finished?: boolean | null;
+  tokens?: number | null;
+  margin?: number | null;
+  limited?: 'cap' | 'timeout' | 'budget' | null;
+}
 
 export interface Meta {
   model: string;
-  latency_ms: number;
+  latency_ms?: number | null;
+  question_count?: number | null;
+  compute_mode?: string | null;
+  usage?: Usage | null;
+  /** Omitted on kinds without a reasoning pass. */
+  reasoning?: ReasoningMeta | null;
 }
 
-/** Metadata returned when grounding (web search) ran for a decision. */
+export interface Source {
+  url?: string | null;
+  title?: string | null;
+  snippet?: string | null;
+}
+
 export interface GroundingMeta {
   triggered: boolean;
+  trigger_reason?: string | null;
   queries?: string[];
-  sources?: unknown[];
-  [key: string]: unknown;
+  sources?: Source[];
+  added_context_tokens?: number | null;
+  search_ms?: number | null;
 }
 
-/** The full response for a single `decide` call. */
+// --- envelopes ---------------------------------------------------------------
+
+/** A `/decide` response. `grounding_meta` is present when grounding was requested. */
 export interface DecideEnvelope<K extends Kind = Kind> {
   id: string;
   kind: K;
   result: ResultForKind[K];
   meta: Meta;
-  grounding_meta?: GroundingMeta;
+  grounding_meta?: GroundingMeta | null;
 }
 
 /**
- * One entry in a batch result, aligned to the input question order.
- *
- * A successful item (`ok: true`) reads exactly like a single `decide`: `result`
- * is the bare payload (same shape as `DecideEnvelope.result`), with `meta` and,
- * when grounding ran, `grounding_meta` alongside it. A failed item (`ok: false`)
- * carries `error` instead. On the wire the server nests a full envelope under
- * each item's `result`; the client flattens it so access matches single decide.
+ * One batch answer, in question order. `ok: true` reads like a single decide
+ * (`result`, `meta`, `grounding_meta`); `ok: false` carries `error`.
  */
 export interface BatchItem {
   id: string;
@@ -139,14 +159,25 @@ export interface BatchItem {
   ok: boolean;
   result?: Result;
   meta?: Meta;
-  grounding_meta?: GroundingMeta;
+  grounding_meta?: GroundingMeta | null;
   error?: string;
 }
 
-/**
- * One group of a grouped batch (`decideGroups`), aligned to the input groups.
- * `items` are the flattened `BatchItem`s for that group's questions, in order.
- */
 export interface GroupResult {
   items: BatchItem[];
 }
+
+/** Call-level meta of a batch. Usage and latency are reported here, not per answer. */
+export interface BatchMeta {
+  model: string;
+  request_count: number;
+  question_count: number;
+  latency_ms?: number | null;
+  usage?: Usage | null;
+}
+
+/** The items of a batch `decide`, in question order, plus the call's `meta`. */
+export type BatchResult = BatchItem[] & { meta: BatchMeta };
+
+/** One `GroupResult` per group, in order, plus the call's `meta`. */
+export type GroupsResult = GroupResult[] & { meta: BatchMeta };

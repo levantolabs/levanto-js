@@ -2,318 +2,216 @@ import { Http, type FetchLike } from './http';
 import { LevantoError } from './errors';
 import { VERSION } from './version';
 import {
-  YesNo,
   Choice,
   Scale,
   Sort,
   Tags,
-  type Question,
-  type Grounding,
-  type GroundedOpts,
-  type TagsOpts,
-  type IdOpts,
+  YesNo,
+  groundingToWire,
   type ChoiceOption,
+  type GroundedOpts,
+  type IdOpts,
+  type Question,
   type ScaleLevel,
   type TagSpec,
+  type TagsOpts,
 } from './questions';
 import type {
-  Content,
-  DocumentInput,
-  Kind,
-  DecideEnvelope,
   BatchItem,
-  GroupResult,
-  YesNoResult,
+  BatchMeta,
+  BatchResult,
   ChoiceResult,
+  Content,
+  DecideEnvelope,
+  DocumentInput,
+  GroupsResult,
+  Reasoning,
   ScaleResult,
   SortResult,
   TagsResult,
+  YesNoResult,
 } from './types';
 
-const DEFAULT_BASE_URL = 'https://sage.levanto.ai';
-const DEFAULT_TIMEOUT_MS = 60_000;
-const DEFAULT_MAX_RETRIES = 3;
-
 export interface LevantoClientOptions {
-  apiKey: string;
+  /** Defaults to the `LEVANTO_API_KEY` environment variable (Node). */
+  apiKey?: string;
+  /** Default `https://sage.levanto.ai`. */
   baseUrl?: string;
+  /** Per-attempt timeout in ms. Default 60000 (keep it above the 6 s reasoning budget). */
   timeout?: number;
+  /** Retries for network errors and 429/500/502/503/504. Default 3. */
   maxRetries?: number;
-  /** Override the transport (mainly for tests / custom environments). */
+  /** Default reasoning for every call. Unset: the server default (`auto`). */
+  reasoning?: Reasoning;
+  /** Custom `fetch` (tests, proxies, other runtimes). */
   fetch?: FetchLike;
 }
 
-/** A shared document plus the questions to ask about it (one batch group). */
+/** Per-call options. `reasoning` overrides the client default; `null` sends none. */
+export interface CallOpts {
+  reasoning?: Reasoning | null;
+}
+
+/** One document plus the questions to ask about it (`decideGroups`). */
 export interface QuestionGroup {
   document: DocumentInput;
   questions: Question[];
 }
 
-// --- Wire shapes (internal) ------------------------------------------------
-
-interface WireQuestion {
-  id: string;
-  kind: Kind;
-  instructions?: string;
-  options?: ChoiceOption[];
-  levels?: ScaleLevel[];
-  tags?: TagSpec[];
-}
-
-interface WireRequest {
-  content: Content;
-  question: WireQuestion;
-  grounding?: Record<string, unknown>;
-}
-
-/** A batch question embeds grounding inside the question (unlike single decide). */
-interface WireBatchQuestion extends WireQuestion {
-  grounding?: Record<string, unknown>;
-}
-
-/** One request group: a shared document plus the questions to ask about it. */
-interface WireGroup {
-  content: Content;
-  questions: WireBatchQuestion[];
-}
-
-interface WireBatchRequest {
-  requests: WireGroup[];
-}
-
-/** One answer inside a group's `answers`, in question order. */
 interface WireAnswer {
   ok: boolean;
-  /** On success the server nests a full single-decide envelope here. */
   result?: DecideEnvelope | null;
   error?: string | null;
 }
 
-interface WireGroupResult {
-  answers: WireAnswer[];
-}
-
 interface WireBatchResponse {
-  results: WireGroupResult[];
-  meta: { request_count: number; question_count: number };
+  results?: Array<{ answers?: WireAnswer[] }>;
+  meta?: BatchMeta;
 }
 
-// --- Serialization helpers -------------------------------------------------
+function withMeta<T>(list: T[], res: WireBatchResponse): T[] & { meta: BatchMeta } {
+  return Object.assign(list, { meta: res.meta ?? ({} as BatchMeta) });
+}
 
-/** Normalize a caller `document` into the wire `content` shape. */
-function normalizeContent(document: DocumentInput): Content {
-  if (typeof document === 'string') return document;
+/** @internal */
+export function toContent(document: DocumentInput): Content {
   if (Array.isArray(document)) return { kind: 'list', value: document };
   return document;
 }
 
-/**
- * Translate a `Grounding` bag into wire form: `confidenceFloor` becomes
- * `confidence_floor`; every other key passes through unchanged.
- */
-function serializeGrounding(g: Grounding): Record<string, unknown> {
-  const { confidenceFloor, ...rest } = g;
-  const out: Record<string, unknown> = { ...rest };
-  if (confidenceFloor !== undefined) out.confidence_floor = confidenceFloor;
-  return out;
+/** @internal Body for `POST /decide`: grounding is top-level; the id defaults to the kind. */
+export function singleBody(document: DocumentInput, q: Question, reasoning?: Reasoning | null) {
+  const body: Record<string, unknown> = { content: toContent(document), question: q.toWire(q.kind) };
+  if (q.grounding) body.grounding = groundingToWire(q.grounding);
+  if (reasoning) body.reasoning = reasoning;
+  return body;
 }
 
-/**
- * Build the wire `question` object plus the (top-level) grounding sibling.
- * Grounding is attached to the question for ergonomics but lifted here.
- */
-function serializeQuestion(
-  q: Question,
-  id: string
-): { question: WireQuestion; grounding?: Record<string, unknown> } {
-  const question: WireQuestion = { id, kind: q.kind };
-  // `instructions` is required for every kind except `tags`, where it is
-  // optional; only emit it for tags when the caller actually set one.
-  if (q.kind === 'tags') {
-    if (q.instructions !== undefined) question.instructions = q.instructions;
-  } else {
-    question.instructions = q.instructions;
-  }
-  if (q.kind === 'choice') question.options = q.options;
-  else if (q.kind === 'scale') question.levels = q.levels;
-  else if (q.kind === 'tags') question.tags = q.tags;
-
-  let grounding: Record<string, unknown> | undefined;
-  if (q.kind !== 'sort' && q.grounding) {
-    grounding = serializeGrounding(q.grounding);
-  }
-  return { question, grounding };
+/** @internal Body for `POST /decide/batch`: grounding sits inside each question; ids default to q0, q1, … */
+export function batchBody(groups: QuestionGroup[], reasoning?: Reasoning | null) {
+  const requests = groups.map(({ document, questions }) => {
+    if (questions.length === 0) throw new LevantoError('Every batch group needs at least one question.');
+    return {
+      content: toContent(document),
+      questions: questions.map((q, i) => {
+        const wire: Record<string, unknown> = { ...q.toWire(`q${i}`) };
+        if (q.grounding) wire.grounding = groundingToWire(q.grounding);
+        return wire;
+      }),
+    };
+  });
+  const body: Record<string, unknown> = { requests };
+  if (reasoning) body.reasoning = reasoning;
+  return body;
 }
 
-/**
- * Build a batch question. Unlike single `decide` (where grounding is lifted to
- * a top-level sibling), the batch wire form embeds grounding inside the question.
- */
-function serializeBatchQuestion(q: Question, id: string): WireBatchQuestion {
-  const { question, grounding } = serializeQuestion(q, id);
-  const out: WireBatchQuestion = { ...question };
-  if (grounding) out.grounding = grounding;
-  return out;
-}
-
-/** Build one request group: shared content + its questions (ids default q0,q1,…). */
-function buildGroup(document: DocumentInput, questions: Question[]): WireGroup {
-  return {
-    content: normalizeContent(document),
-    questions: questions.map((q, i) => serializeBatchQuestion(q, q.id ?? `q${i}`)),
-  };
-}
-
-/** Flatten a group's answers into BatchItem[], aligned to the input questions. */
-function flattenAnswers(
-  questions: Question[],
-  group: WireGroupResult | undefined
-): BatchItem[] {
+function flatten(questions: Question[], answers: WireAnswer[] = []): BatchItem[] {
   return questions.map((q, i) => {
-    const raw = group?.answers?.[i];
-    const env = raw?.result ?? undefined;
-    const item: BatchItem = { id: q.id ?? `q${i}`, kind: q.kind, ok: raw?.ok ?? false };
-    // Flatten the nested envelope so a batch item reads like a single decide.
-    if (env) {
-      item.result = env.result;
-      item.meta = env.meta;
-      if (env.grounding_meta) item.grounding_meta = env.grounding_meta;
+    const raw = answers[i] ?? { ok: false, error: 'missing answer in response' };
+    const item: BatchItem = { id: q.id ?? `q${i}`, kind: q.kind, ok: Boolean(raw.ok) };
+    if (raw.result) {
+      item.result = raw.result.result;
+      item.meta = raw.result.meta;
+      if (raw.result.grounding_meta) item.grounding_meta = raw.result.grounding_meta;
     }
-    if (raw?.error != null) item.error = raw.error;
+    if (raw.error != null) item.error = raw.error;
     return item;
   });
 }
 
-// --- Client ----------------------------------------------------------------
+function envApiKey(): string | undefined {
+  const g = globalThis as { process?: { env?: Record<string, string | undefined> } };
+  return g.process?.env?.LEVANTO_API_KEY;
+}
 
-/** Client for the Levanto Sage decision API. */
+/** Client for the Levanto Sage decision API (v1.1). */
 export class LevantoClient {
   private readonly http: Http;
+  private readonly reasoning?: Reasoning;
 
-  constructor(options: LevantoClientOptions) {
-    if (!options || !options.apiKey) {
-      throw new LevantoError('LevantoClient requires an `apiKey`.');
-    }
-    const baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
+  constructor(options: LevantoClientOptions = {}) {
+    const apiKey = options.apiKey ?? envApiKey();
+    if (!apiKey) throw new LevantoError('No API key: pass { apiKey } or set LEVANTO_API_KEY.');
+    this.reasoning = options.reasoning;
     this.http = new Http({
-      apiKey: options.apiKey,
-      baseUrl,
-      timeout: options.timeout ?? DEFAULT_TIMEOUT_MS,
-      maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
+      apiKey,
+      baseUrl: (options.baseUrl ?? 'https://sage.levanto.ai').replace(/\/+$/, ''),
+      timeout: options.timeout ?? 60_000,
+      maxRetries: options.maxRetries ?? 3,
       userAgent: `levanto-js/${VERSION}`,
       fetchImpl: options.fetch,
     });
   }
 
-  /** One decision over a document. Returns the full envelope. */
-  decide<Q extends Question>(
-    document: DocumentInput,
-    question: Q
-  ): Promise<DecideEnvelope<Q['kind']>>;
-  /** Fan the same document across N questions. Returns aligned batch items. */
-  decide(document: DocumentInput, questions: Question[]): Promise<BatchItem[]>;
-  decide(
-    document: DocumentInput,
-    question: Question | Question[]
-  ): Promise<DecideEnvelope | BatchItem[]> {
-    return Array.isArray(question)
-      ? this.decideBatch(document, question)
-      : this.decideSingle(document, question);
+  private pick(opts: CallOpts): Reasoning | null | undefined {
+    return opts.reasoning === undefined ? this.reasoning : opts.reasoning;
   }
 
+  /** One question: `POST /decide`, returns the full envelope. */
+  decide<Q extends Question>(document: DocumentInput, question: Q, opts?: CallOpts): Promise<DecideEnvelope<Q['kind']>>;
   /**
-   * Score several documents in one round-trip, each with its own questions.
-   * Returns one `GroupResult` per input group, in order; each group's `items`
-   * are aligned to that group's questions (same flattened shape as `decide`).
+   * Several questions about one document: one `POST /decide/batch` call, one item per question, in order.
+   * The array also has `meta`: usage and latency for the whole call (not reported per item).
    */
-  async decideGroups(groups: QuestionGroup[]): Promise<GroupResult[]> {
-    const body: WireBatchRequest = {
-      requests: groups.map((g) => buildGroup(g.document, g.questions)),
-    };
-    const response = await this.http.request<WireBatchResponse>('POST', '/decide/batch', body);
-    return groups.map((g, i) => ({
-      items: flattenAnswers(g.questions, response.results?.[i]),
-    }));
-  }
-
-  /** Yes/no shortcut. Returns just the result payload. */
-  async yesno(
+  decide(document: DocumentInput, questions: Question[], opts?: CallOpts): Promise<BatchResult>;
+  async decide(
     document: DocumentInput,
-    instructions: string,
-    opts: GroundedOpts = {}
-  ): Promise<YesNoResult> {
-    const env = await this.decideSingle(document, new YesNo(instructions, opts));
-    return env.result as YesNoResult;
+    question: Question | Question[],
+    opts: CallOpts = {}
+  ): Promise<DecideEnvelope | BatchResult> {
+    if (Array.isArray(question)) {
+      const res = await this.http.post<WireBatchResponse>(
+        '/decide/batch',
+        batchBody([{ document, questions: question }], this.pick(opts))
+      );
+      return withMeta(flatten(question, res.results?.[0]?.answers), res);
+    }
+    return this.http.post<DecideEnvelope>('/decide', singleBody(document, question, this.pick(opts)));
   }
 
-  /** Choice shortcut. Returns just the result payload. */
-  async choice(
-    document: DocumentInput,
-    instructions: string,
-    options: Array<string | ChoiceOption>,
-    opts: GroundedOpts = {}
-  ): Promise<ChoiceResult> {
-    const env = await this.decideSingle(document, new Choice(instructions, options, opts));
-    return env.result as ChoiceResult;
+  /** Several documents, each with its own questions, in one `POST /decide/batch` call. The array also has `meta`. */
+  async decideGroups(groups: QuestionGroup[], opts: CallOpts = {}): Promise<GroupsResult> {
+    const res = await this.http.post<WireBatchResponse>('/decide/batch', batchBody(groups, this.pick(opts)));
+    return withMeta(
+      groups.map((g, i) => ({ items: flatten(g.questions, res.results?.[i]?.answers) })),
+      res
+    );
   }
 
-  /** Scale shortcut. Returns just the result payload. */
-  async scale(
-    document: DocumentInput,
-    instructions: string,
-    levels: Array<string | ScaleLevel>,
-    opts: GroundedOpts = {}
-  ): Promise<ScaleResult> {
-    const env = await this.decideSingle(document, new Scale(instructions, levels, opts));
-    return env.result as ScaleResult;
-  }
-
-  /** Sort shortcut. `items` is the list to order. Returns the result payload. */
-  async sort(
-    items: DocumentInput,
-    instructions: string,
-    opts: IdOpts = {}
-  ): Promise<SortResult> {
-    const env = await this.decideSingle(items, new Sort(instructions, opts));
-    return env.result as SortResult;
-  }
-
-  /** Tags shortcut. Returns just the result payload. */
-  async tags(
-    document: DocumentInput,
-    tags: Array<string | TagSpec>,
-    opts: TagsOpts = {}
-  ): Promise<TagsResult> {
-    const env = await this.decideSingle(document, new Tags(tags, opts));
-    return env.result as TagsResult;
-  }
-
-  /** Health check. `GET /ready`: true on 200, false otherwise. */
+  /** `GET /ready`: true when Sage is serving. */
   ready(): Promise<boolean> {
     return this.http.ready();
   }
 
-  // --- internals ---
+  // Shortcuts: one question, returns only its `result`.
 
-  private decideSingle(
-    document: DocumentInput,
-    q: Question
-  ): Promise<DecideEnvelope> {
-    const content = normalizeContent(document);
-    const { question, grounding } = serializeQuestion(q, q.id ?? q.kind);
-    const body: WireRequest = { content, question };
-    if (grounding) body.grounding = grounding;
-    return this.http.request<DecideEnvelope>('POST', '/decide', body);
+  async yesno(document: DocumentInput, instructions: string, opts: GroundedOpts & CallOpts = {}): Promise<YesNoResult> {
+    return (await this.decide(document, new YesNo(instructions, opts), opts)).result;
   }
 
-  private async decideBatch(
+  async choice(
     document: DocumentInput,
-    questions: Question[]
-  ): Promise<BatchItem[]> {
-    // One document + N questions is a single group under the v0.5 batch API
-    // (the shared content is sent once, not repeated per question).
-    const body: WireBatchRequest = { requests: [buildGroup(document, questions)] };
-    const response = await this.http.request<WireBatchResponse>('POST', '/decide/batch', body);
-    return flattenAnswers(questions, response.results?.[0]);
+    instructions: string,
+    options: Array<string | ChoiceOption>,
+    opts: GroundedOpts & CallOpts = {}
+  ): Promise<ChoiceResult> {
+    return (await this.decide(document, new Choice(instructions, options, opts), opts)).result;
+  }
+
+  async scale(
+    document: DocumentInput,
+    instructions: string,
+    levels: Array<string | ScaleLevel>,
+    opts: GroundedOpts & CallOpts = {}
+  ): Promise<ScaleResult> {
+    return (await this.decide(document, new Scale(instructions, levels, opts), opts)).result;
+  }
+
+  async sort(items: DocumentInput, instructions: string, opts: IdOpts & CallOpts = {}): Promise<SortResult> {
+    return (await this.decide(items, new Sort(instructions, opts), opts)).result;
+  }
+
+  async tags(document: DocumentInput, tags: Array<string | TagSpec>, opts: TagsOpts & CallOpts = {}): Promise<TagsResult> {
+    return (await this.decide(document, new Tags(tags, opts), opts)).result;
   }
 }
