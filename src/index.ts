@@ -1,10 +1,10 @@
 // Public entry point for the `levanto` package.
 
 export { LevantoClient } from './client';
-export type { LevantoClientOptions, QuestionGroup } from './client';
+export type { LevantoClientOptions, CallOpts, QuestionGroup } from './client';
 export type { FetchLike } from './http';
 
-export { YesNo, Choice, Scale, Sort, Tags } from './questions';
+export { YesNo, Choice, Scale, Sort, Tags, image, imageFromBytes } from './questions';
 export type {
   Question,
   Grounding,
@@ -13,19 +13,21 @@ export type {
   ScaleLevel,
   ScaleLevelValue,
   TagSpec,
-  GroundedOpts,
   IdOpts,
+  GroundedOpts,
+  TagsOpts,
+  ImageMimeType,
 } from './questions';
 
 export type {
   Kind,
+  Reasoning,
   DocumentInput,
   Content,
   TextContent,
+  ImageContent,
   ListContent,
   ListItem,
-  Meta,
-  GroundingMeta,
   YesNoResult,
   ChoiceProbability,
   ChoiceResult,
@@ -35,6 +37,11 @@ export type {
   TagsResult,
   Result,
   ResultForKind,
+  Usage,
+  ReasoningMeta,
+  Meta,
+  Source,
+  GroundingMeta,
   DecideEnvelope,
   BatchItem,
   GroupResult,
@@ -43,6 +50,7 @@ export type {
 export {
   LevantoError,
   AuthError,
+  AllowanceExhaustedError,
   ValidationError,
   ServiceUnavailableError,
   LevantoAPIError,

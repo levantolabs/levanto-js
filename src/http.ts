@@ -9,152 +9,94 @@ export interface HttpConfig {
   timeout: number;
   maxRetries: number;
   userAgent: string;
-  /** Override the transport (mainly for tests / custom environments). */
   fetchImpl?: FetchLike;
 }
 
-/** Statuses that warrant a retry (endpoint is scale-to-zero). */
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
-const BASE_BACKOFF_MS = 250;
-const MAX_BACKOFF_MS = 20_000;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-/** Exponential backoff with full-ish jitter (half fixed, half random). */
-function backoffMs(attempt: number): number {
-  const capped = Math.min(BASE_BACKOFF_MS * 2 ** attempt, MAX_BACKOFF_MS);
-  return capped * (0.5 + Math.random() * 0.5);
-}
-
-function isAbortError(err: unknown): boolean {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    'name' in err &&
-    (err as { name?: unknown }).name === 'AbortError'
-  );
-}
-
-function errMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-async function parseJson<T>(response: Response): Promise<T> {
-  const text = await response.text();
-  if (!text) return undefined as unknown as T;
-  return JSON.parse(text) as T;
-}
-
-/** Pull the server `detail` string out of an error response body. */
-async function extractDetail(response: Response): Promise<string> {
-  let text = '';
-  try {
-    text = await response.text();
-  } catch {
-    return '';
+/** @internal Milliseconds before retry `attempt` (0-based): `Retry-After` if sent, else exponential with jitter. */
+export function backoffMs(attempt: number, response?: Response): number {
+  const retryAfter = response?.headers.get('retry-after');
+  if (retryAfter != null) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.min(Math.max(seconds, 0), 30) * 1000;
   }
-  if (!text) return '';
+  return Math.random() * Math.min(8000, 500 * 2 ** attempt);
+}
+
+async function detailOf(response: Response): Promise<string> {
+  const text = await response.text().catch(() => '');
   try {
     const data = JSON.parse(text) as unknown;
     if (data && typeof data === 'object' && 'detail' in data) {
       const detail = (data as { detail: unknown }).detail;
       return typeof detail === 'string' ? detail : JSON.stringify(detail);
     }
-    if (typeof data === 'string') return data;
   } catch {
-    // Body was not JSON; fall through to the raw text.
+    // not JSON: use the raw text
   }
   return text;
 }
 
-/**
- * Thin HTTP layer: auth header, JSON encode/decode, per-attempt timeout via
- * `AbortController`, retry with exponential backoff + jitter, and status ->
- * typed-error mapping.
- */
+const isAbort = (err: unknown) =>
+  typeof err === 'object' && err !== null && (err as { name?: string }).name === 'AbortError';
+
+/** @internal Auth, JSON, per-attempt timeout, retries, and status -> error mapping. */
 export class Http {
   constructor(private readonly config: HttpConfig) {}
 
-  private get fetchImpl(): FetchLike {
-    // Resolve the global lazily so that tests which reassign `global.fetch`
-    // after the client is constructed are still picked up.
-    return this.config.fetchImpl ?? ((input, init) => globalThis.fetch(input, init));
+  private fetch(url: string, init: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.config.timeout);
+    const impl = this.config.fetchImpl ?? ((u, i) => globalThis.fetch(u, i));
+    return impl(url, { ...init, signal: controller.signal }).finally(() => clearTimeout(timer));
   }
 
-  /** Perform an authenticated JSON request with retries. */
-  async request<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
-    const url = `${this.config.baseUrl}${path}`;
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.config.apiKey}`,
-      'User-Agent': this.config.userAgent,
-      Accept: 'application/json',
+  async post<T>(path: string, body: unknown): Promise<T> {
+    const init: RequestInit = {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.config.apiKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': this.config.userAgent,
+      },
+      body: JSON.stringify(body),
     };
-    let payload: string | undefined;
-    if (body !== undefined) {
-      headers['Content-Type'] = 'application/json';
-      payload = JSON.stringify(body);
-    }
-
-    let lastError: unknown;
-    for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
+    for (let attempt = 0; ; attempt++) {
       let response: Response;
       try {
-        response = await this.fetchOnce(url, { method, headers, body: payload });
+        response = await this.fetch(`${this.config.baseUrl}${path}`, init);
       } catch (err) {
-        if (isAbortError(err)) {
-          throw new LevantoError(
-            `Request to ${path} timed out after ${this.config.timeout}ms`
-          );
-        }
-        lastError = err;
+        // A timed-out request may still have been processed (and billed), so it is not retried.
+        if (isAbort(err)) throw new LevantoError(`POST ${path} timed out after ${this.config.timeout} ms`);
         if (attempt < this.config.maxRetries) {
           await sleep(backoffMs(attempt));
           continue;
         }
-        throw new LevantoError(`Request to ${path} failed: ${errMessage(err)}`);
+        throw new LevantoError(`POST ${path} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-
-      if (response.ok) {
-        return parseJson<T>(response);
-      }
-
+      if (response.ok) return (await response.json()) as T;
       if (RETRYABLE_STATUS.has(response.status) && attempt < this.config.maxRetries) {
-        await sleep(backoffMs(attempt));
+        await sleep(backoffMs(attempt, response));
         continue;
       }
-
-      const detail = await extractDetail(response);
-      throw errorForStatus(response.status, detail);
+      throw errorForStatus(response.status, await detailOf(response));
     }
-
-    // Unreachable in practice (loop either returns or throws), but keeps the
-    // type checker satisfied and gives a sane message if it ever happens.
-    throw new LevantoError(`Request to ${path} failed: ${errMessage(lastError)}`);
   }
 
-  /** `GET /ready`: 200 -> true, anything else -> false. No key required. */
+  /** `GET /ready`: true on 200. Never retried; network errors return false. */
   async ready(): Promise<boolean> {
-    const url = `${this.config.baseUrl}/ready`;
     try {
-      const response = await this.fetchOnce(url, {
+      const response = await this.fetch(`${this.config.baseUrl}/ready`, {
         method: 'GET',
-        headers: { 'User-Agent': this.config.userAgent, Accept: 'application/json' },
+        headers: { 'User-Agent': this.config.userAgent },
       });
       return response.status === 200;
     } catch {
       return false;
-    }
-  }
-
-  private async fetchOnce(url: string, init: RequestInit): Promise<Response> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.config.timeout);
-    try {
-      return await this.fetchImpl(url, { ...init, signal: controller.signal });
-    } finally {
-      clearTimeout(timer);
     }
   }
 }

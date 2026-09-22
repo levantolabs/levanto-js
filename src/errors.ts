@@ -1,64 +1,45 @@
-/**
- * Error hierarchy for the Levanto SDK.
- *
- * Every error carries the HTTP `status` (when it originated from a response)
- * and the server-provided `detail` string, so callers can branch on type and
- * still surface the raw message.
- */
+/** Base class for every SDK error. Also thrown for network failures and timeouts (`status` undefined). */
 export class LevantoError extends Error {
-  /** HTTP status code, when the error came from an API response. */
+  /** HTTP status, when the error came from a response. */
   readonly status?: number;
-  /** The `detail` string returned by the server, when present. */
+  /** The server's `detail` message, when there is one. */
   readonly detail?: string;
 
   constructor(message: string, status?: number, detail?: string) {
     super(message);
-    this.name = 'LevantoError';
+    this.name = new.target.name;
     this.status = status;
     this.detail = detail;
-    // Restore the prototype chain (required when targeting ES5/ES2015 classes
-    // that extend built-ins). Harmless on modern targets.
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
-/** Missing/invalid API key (401) or balance too low (402). */
-export class AuthError extends LevantoError {
-  constructor(message: string, status?: number, detail?: string) {
-    super(message, status, detail);
-    this.name = 'AuthError';
-  }
-}
+/** 401: the API key is missing or invalid. */
+export class AuthError extends LevantoError {}
 
-/** The request failed server-side validation (400/422). */
-export class ValidationError extends LevantoError {
-  constructor(message: string, status?: number, detail?: string) {
-    super(message, status, detail);
-    this.name = 'ValidationError';
-  }
-}
+/** 402: the key is valid, but this period's decision allowance is used up. */
+export class AllowanceExhaustedError extends AuthError {}
 
-/** The model/endpoint is unavailable, e.g. still loading (503). */
-export class ServiceUnavailableError extends LevantoError {
-  constructor(message: string, status?: number, detail?: string) {
-    super(message, status, detail);
-    this.name = 'ServiceUnavailableError';
-  }
-}
+/** 400/422: the request was rejected (schema, limits, or an unsupported combination). */
+export class ValidationError extends LevantoError {}
+
+/** 503 after retries: Sage is loading or temporarily unavailable. */
+export class ServiceUnavailableError extends LevantoError {}
 
 /** Any other non-2xx response. */
-export class LevantoAPIError extends LevantoError {
-  constructor(message: string, status?: number, detail?: string) {
-    super(message, status, detail);
-    this.name = 'LevantoAPIError';
-  }
-}
+export class LevantoAPIError extends LevantoError {}
 
-/** Map an HTTP status + server detail to the appropriate typed error. */
 export function errorForStatus(status: number, detail: string): LevantoError {
-  const message = detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`;
-  if (status === 401 || status === 402) return new AuthError(message, status, detail);
-  if (status === 400 || status === 422) return new ValidationError(message, status, detail);
-  if (status === 503) return new ServiceUnavailableError(message, status, detail);
-  return new LevantoAPIError(message, status, detail);
+  const message = `HTTP ${status}${detail ? `: ${detail}` : ''}`;
+  const Cls =
+    status === 400 || status === 422
+      ? ValidationError
+      : status === 401
+        ? AuthError
+        : status === 402
+          ? AllowanceExhaustedError
+          : status === 503
+            ? ServiceUnavailableError
+            : LevantoAPIError;
+  return new Cls(message, status, detail || undefined);
 }
