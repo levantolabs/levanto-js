@@ -18,11 +18,13 @@ import {
 } from './questions';
 import type {
   BatchItem,
+  BatchMeta,
+  BatchResult,
   ChoiceResult,
   Content,
   DecideEnvelope,
   DocumentInput,
-  GroupResult,
+  GroupsResult,
   Reasoning,
   ScaleResult,
   SortResult,
@@ -64,6 +66,11 @@ interface WireAnswer {
 
 interface WireBatchResponse {
   results?: Array<{ answers?: WireAnswer[] }>;
+  meta?: BatchMeta;
+}
+
+function withMeta<T>(list: T[], res: WireBatchResponse): T[] & { meta: BatchMeta } {
+  return Object.assign(list, { meta: res.meta ?? ({} as BatchMeta) });
 }
 
 /** @internal */
@@ -142,27 +149,33 @@ export class LevantoClient {
 
   /** One question: `POST /decide`, returns the full envelope. */
   decide<Q extends Question>(document: DocumentInput, question: Q, opts?: CallOpts): Promise<DecideEnvelope<Q['kind']>>;
-  /** Several questions about one document: one `POST /decide/batch` call, one item per question, in order. */
-  decide(document: DocumentInput, questions: Question[], opts?: CallOpts): Promise<BatchItem[]>;
+  /**
+   * Several questions about one document: one `POST /decide/batch` call, one item per question, in order.
+   * The array also has `meta`: usage and latency for the whole call (not reported per item).
+   */
+  decide(document: DocumentInput, questions: Question[], opts?: CallOpts): Promise<BatchResult>;
   async decide(
     document: DocumentInput,
     question: Question | Question[],
     opts: CallOpts = {}
-  ): Promise<DecideEnvelope | BatchItem[]> {
+  ): Promise<DecideEnvelope | BatchResult> {
     if (Array.isArray(question)) {
       const res = await this.http.post<WireBatchResponse>(
         '/decide/batch',
         batchBody([{ document, questions: question }], this.pick(opts))
       );
-      return flatten(question, res.results?.[0]?.answers);
+      return withMeta(flatten(question, res.results?.[0]?.answers), res);
     }
     return this.http.post<DecideEnvelope>('/decide', singleBody(document, question, this.pick(opts)));
   }
 
-  /** Several documents, each with its own questions, in one `POST /decide/batch` call. */
-  async decideGroups(groups: QuestionGroup[], opts: CallOpts = {}): Promise<GroupResult[]> {
+  /** Several documents, each with its own questions, in one `POST /decide/batch` call. The array also has `meta`. */
+  async decideGroups(groups: QuestionGroup[], opts: CallOpts = {}): Promise<GroupsResult> {
     const res = await this.http.post<WireBatchResponse>('/decide/batch', batchBody(groups, this.pick(opts)));
-    return groups.map((g, i) => ({ items: flatten(g.questions, res.results?.[i]?.answers) }));
+    return withMeta(
+      groups.map((g, i) => ({ items: flatten(g.questions, res.results?.[i]?.answers) })),
+      res
+    );
   }
 
   /** `GET /ready`: true when Sage is serving. */

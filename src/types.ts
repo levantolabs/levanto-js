@@ -166,3 +166,18 @@ export interface BatchItem {
 export interface GroupResult {
   items: BatchItem[];
 }
+
+/** Call-level meta of a batch. Usage and latency are reported here, not per answer. */
+export interface BatchMeta {
+  model: string;
+  request_count: number;
+  question_count: number;
+  latency_ms?: number | null;
+  usage?: Usage | null;
+}
+
+/** The items of a batch `decide`, in question order, plus the call's `meta`. */
+export type BatchResult = BatchItem[] & { meta: BatchMeta };
+
+/** One `GroupResult` per group, in order, plus the call's `meta`. */
+export type GroupsResult = GroupResult[] & { meta: BatchMeta };

@@ -44,7 +44,10 @@ export type {
   GroundingMeta,
   DecideEnvelope,
   BatchItem,
+  BatchMeta,
+  BatchResult,
   GroupResult,
+  GroupsResult,
 } from './types';
 
 export {

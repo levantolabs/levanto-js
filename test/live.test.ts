@@ -113,7 +113,9 @@ describe.skipIf(!KEY)('live: with LEVANTO_API_KEY', () => {
     const items = out.flatMap((g) => g.items);
     expect(items.every((i) => i.ok), JSON.stringify(items)).toBe(true);
     expect(items.map((i) => i.id)).toEqual(['q0', 'urgency', 'q0', 'q0']);
-    expect(out[2].items[0].meta?.usage?.image_count).toBe(1);
+    // In a batch, usage is reported once for the call, not per answer.
+    expect(out.meta.usage?.image_count).toBe(1);
+    expect(out.meta.question_count).toBe(4);
   });
 
   it('a failing batch question is isolated', async () => {

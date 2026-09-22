@@ -6,7 +6,7 @@ import {
   Sort,
   Tags,
   YesNo,
-  type BatchItem,
+  type BatchResult,
   type ChoiceResult,
   type DecideEnvelope,
   type SortResult,
@@ -88,12 +88,25 @@ describe('responses', () => {
   });
 });
 
+it('batch meta is kept', async () => {
+  const meta = { model: 'levanto-sage-v1.1', request_count: 1, question_count: 2, latency_ms: 240.2,
+    usage: { billed_input_tokens: 14, image_count: 1, image_tokens: 65 } };
+  const body = { ...samples.batch([samples.YESNO, samples.SCALE]), meta };
+  const items = await client(new Recorder([200, body])).decide('doc', [new YesNo('a'), new Scale('b', LEVELS)]);
+  expect(items.meta).toEqual(meta);
+  expect(items).toHaveLength(2);
+  expect(items[0].ok).toBe(true);
+  const groups = await client(new Recorder([200, body])).decideGroups([{ document: 'doc', questions: [new YesNo('a'), new Scale('b', LEVELS)] }]);
+  expect(groups.meta).toEqual(meta);
+  expect(groups[0].items[1].kind).toBe('scale');
+});
+
 describe('types', () => {
   it('decide narrows the result type by question kind', () => {
     const c = client(new Recorder());
     expectTypeOf(c.decide('d', new YesNo('q'))).resolves.toEqualTypeOf<DecideEnvelope<'yesno'>>();
     expectTypeOf<DecideEnvelope<'yesno'>['result']>().toEqualTypeOf<YesNoResult>();
-    expectTypeOf(c.decide('d', [new YesNo('q')])).resolves.toEqualTypeOf<BatchItem[]>();
+    expectTypeOf(c.decide('d', [new YesNo('q')])).resolves.toEqualTypeOf<BatchResult>();
     expectTypeOf(c.choice('d', 'q', ['a'])).resolves.toEqualTypeOf<ChoiceResult>();
     expectTypeOf(c.sort([], 'q')).resolves.toEqualTypeOf<SortResult>();
     expectTypeOf(c.tags('d', ['a'])).resolves.toEqualTypeOf<TagsResult>();
